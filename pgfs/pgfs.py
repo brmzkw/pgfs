@@ -1,154 +1,78 @@
 import argparse
+import errno
 import logging
+import os
+import stat
 
-from collections import defaultdict
-from errno import ENOENT
-from stat import S_IFDIR, S_IFLNK, S_IFREG
-from time import time
+import psycopg2
 
-from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
+from fuse import FUSE, FuseOSError, LoggingMixIn, Operations
 
 
-class Memory(LoggingMixIn, Operations):
-    def __init__(self):
-        self.files = {}
-        self.data = defaultdict(bytes)
-        self.fd = 0
-        now = time()
-        self.files['/'] = dict(
-            st_mode=(S_IFDIR | 0o755),
-            st_ctime=now,
-            st_mtime=now,
-            st_atime=now,
-            st_nlink=2)
+class PostgresFS(LoggingMixIn, Operations):
+    def __init__(self, dsn):
+        self.db = psycopg2.connect(dsn)
+        self.cursor = self.db.cursor()
+        self.fds = []
 
-    def chmod(self, path, mode):
-        self.files[path]['st_mode'] &= 0o770000
-        self.files[path]['st_mode'] |= mode
-        return 0
-
-    def chown(self, path, uid, gid):
-        self.files[path]['st_uid'] = uid
-        self.files[path]['st_gid'] = gid
-
-    def create(self, path, mode):
-        self.files[path] = dict(
-            st_mode=(S_IFREG | mode),
-            st_nlink=1,
-            st_size=0,
-            st_ctime=time(),
-            st_mtime=time(),
-            st_atime=time())
-
-        self.fd += 1
-        return self.fd
+    def _execute(self, query, params=None):
+        self.cursor.execute(query, params)
+        self.db.commit()
+        return self.cursor
 
     def getattr(self, path, fh=None):
-        if path not in self.files:
-            raise FuseOSError(ENOENT)
+        if path == '/':
+            return super().getattr(path, fh=fh)
 
-        return self.files[path]
+        self._execute("SELECT is_dir, size, ctime, mtime FROM fs WHERE path = %s", (path,))
+        result = self.cursor.fetchone()
+        if result is None:
+            raise FuseOSError(errno.ENOENT)
 
-    def getxattr(self, path, name, position=0):
-        attrs = self.files[path].get('attrs', {})
+        is_dir, size, ctime, mtime = result
+        mode = stat.S_IFDIR | 0o755 if is_dir else stat.S_IFREG | 0o644
+        st = dict(st_mode=mode, st_nlink=2, st_size=size, st_ctime=ctime.timestamp(), st_mtime=mtime.timestamp(), st_atime=mtime.timestamp())
+        return st
 
-        try:
-            return attrs[name]
-        except KeyError:
-            return ''       # Should return ENOATTR
-
-    def listxattr(self, path):
-        attrs = self.files[path].get('attrs', {})
-        return attrs.keys()
-
-    def mkdir(self, path, mode):
-        self.files[path] = dict(
-            st_mode=(S_IFDIR | mode),
-            st_nlink=2,
-            st_size=0,
-            st_ctime=time(),
-            st_mtime=time(),
-            st_atime=time())
-
-        self.files['/']['st_nlink'] += 1
-
-    def open(self, path, flags):
-        self.fd += 1
-        return self.fd
-
-    def read(self, path, size, offset, fh):
-        return self.data[path][offset:offset + size]
+    def create(self, path, mode, fi=None):
+        self._execute("INSERT INTO fs (path, is_dir, data, size) VALUES (%s, FALSE, %s, 0)", (path, psycopg2.Binary(b'')))
+        return 0
 
     def readdir(self, path, fh):
-        return ['.', '..'] + [x[1:] for x in self.files if x != '/']
+        self._execute("SELECT path FROM fs WHERE path LIKE %s", (f'{path.rstrip("/")}/%',))
+        dirents = ['.', '..']
+        dirents.extend([os.path.basename(row[0]) for row in self.cursor.fetchall()])
+        return dirents
 
-    def readlink(self, path):
-        return self.data[path]
-
-    def removexattr(self, path, name):
-        attrs = self.files[path].get('attrs', {})
-
-        try:
-            del attrs[name]
-        except KeyError:
-            pass        # Should return ENOATTR
-
-    def rename(self, old, new):
-        self.data[new] = self.data.pop(old)
-        self.files[new] = self.files.pop(old)
-
-    def rmdir(self, path):
-        # with multiple level support, need to raise ENOTEMPTY if contains any files
-        self.files.pop(path)
-        self.files['/']['st_nlink'] -= 1
-
-    def setxattr(self, path, name, value, options, position=0):
-        # Ignore options
-        attrs = self.files[path].setdefault('attrs', {})
-        attrs[name] = value
-
-    def statfs(self, path):
-        return dict(f_bsize=512, f_blocks=4096, f_bavail=2048)
-
-    def symlink(self, target, source):
-        self.files[target] = dict(
-            st_mode=(S_IFLNK | 0o777),
-            st_nlink=1,
-            st_size=len(source))
-
-        self.data[target] = source
-
-    def truncate(self, path, length, fh=None):
-        # make sure extending the file fills in zero bytes
-        self.data[path] = self.data[path][:length].ljust(
-            length, '\x00'.encode('ascii'))
-        self.files[path]['st_size'] = length
-
-    def unlink(self, path):
-        self.data.pop(path)
-        self.files.pop(path)
-
-    def utimens(self, path, times=None):
-        now = time()
-        atime, mtime = times if times else (now, now)
-        self.files[path]['st_atime'] = atime
-        self.files[path]['st_mtime'] = mtime
+    def read(self, path, size, offset, fh):
+        self._execute("SELECT data FROM fs WHERE path = %s", (path,))
+        result = self.cursor.fetchone()
+        if result is None:
+            raise FuseOSError(errno.ENOENT)
+        data = result[0].tobytes()
+        return data[offset:offset + size]
 
     def write(self, path, data, offset, fh):
-        self.data[path] = (
-            # make sure the data gets inserted at the right offset
-            self.data[path][:offset].ljust(offset, '\x00'.encode('ascii'))
-            + data
-            # and only overwrites the bytes that data is replacing
-            + self.data[path][offset + len(data):])
-        self.files[path]['st_size'] = len(self.data[path])
+        current_data = self.read(path, 1<<32, 0, fh)  # Large size to read all
+        current_data = current_data.tobytes()
+        new_data = current_data[:offset] + data + current_data[offset+len(data):]
+        self._execute("UPDATE fs SET data = %s, size = %s WHERE path = %s", (new_data, len(new_data), path))
         return len(data)
+
+    def truncate(self, path, length, fh=None):
+        self._execute("SELECT data FROM fs WHERE path = %s", (path,))
+        result = self.cursor.fetchone()
+        if result is None:
+            raise FuseOSError(errno.ENOENT)
+        data = result[0][:length]
+        self._execute("UPDATE fs SET data = %s, size = %s WHERE path = %s", (data, len(data), path))
+        return 0
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('mount')
     args = parser.parse_args()
-
+    dsn = os.environ.get('POSTGRES_URL')
     logging.basicConfig(level=logging.DEBUG)
-    fuse = FUSE(Memory(), args.mount, foreground=True, allow_other=True)
+    fuse = FUSE(PostgresFS(dsn=dsn), args.mount, foreground=True, allow_other=True)
