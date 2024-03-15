@@ -10,4 +10,6 @@ RUN poetry install
 
 COPY . /app
 
-CMD while true; do sleep 1; done
+RUN mkdir -p /mnt/pgfs
+
+CMD poetry run pgfs /mnt/pgfs
