@@ -12,4 +12,4 @@ COPY . /app
 
 RUN mkdir -p /mnt/pgfs
 
-CMD poetry install && poetry run pgfs /mnt/pgfs
+CMD ln -s /mnt/pgfs /root/persistent-storage && poetry install && poetry run pgfs /mnt/pgfs
