@@ -10,3 +10,4 @@ RUN poetry install
 
 COPY . /app
 
+CMD while true; do sleep 1; done

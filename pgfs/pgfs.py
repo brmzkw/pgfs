@@ -54,7 +54,8 @@ class PostgresFS(LoggingMixIn, Operations):
 
     def write(self, path, data, offset, fh):
         current_data = self.read(path, 1<<32, 0, fh)  # Large size to read all
-        current_data = current_data.tobytes()
+        if isinstance(current_data, memoryview):
+            current_data = current_data.tobytes()
         new_data = current_data[:offset] + data + current_data[offset+len(data):]
         self._execute("UPDATE fs SET data = %s, size = %s WHERE path = %s", (new_data, len(new_data), path))
         return len(data)
@@ -67,6 +68,19 @@ class PostgresFS(LoggingMixIn, Operations):
         data = result[0][:length]
         self._execute("UPDATE fs SET data = %s, size = %s WHERE path = %s", (data, len(data), path))
         return 0
+
+    def unlink(self, path):
+        self._execute("SELECT is_dir, size, ctime, mtime FROM fs WHERE path = %s", (path,))
+        result = self.cursor.fetchone()
+        if result is None:
+            raise FuseOSError(errno.ENOENT)
+
+        self._execute("DELETE FROM fs WHERE path = %s", path)
+        return 0
+
+
+    def getxattr(self, path, name, position=0):
+        return []
 
 
 def main():
