@@ -11,14 +11,26 @@ from fuse import FUSE, FuseOSError, LoggingMixIn, Operations
 
 class PostgresFS(LoggingMixIn, Operations):
     def __init__(self, dsn):
-        self.db = psycopg2.connect(dsn)
-        self.cursor = self.db.cursor()
         self.fds = []
+        self.dsn = dsn
 
     def _execute(self, query, params=None):
-        self.cursor.execute(query, params)
-        self.db.commit()
-        return self.cursor
+        try:
+            self.db = psycopg2.connect(self.dsn)
+            self.cursor = self.db.cursor()
+            self.cursor.execute(query, params)
+            self.db.commit()
+            self.cursor.close()
+            self.db.close()
+            return self.cursor
+        except: # reconnect, ugly
+            self.db = psycopg2.connect(self.dsn)
+            self.cursor = self.db.cursor()
+            self.cursor.execute(query, params)
+            self.db.commit()
+            self.cursor.close()
+            self.db.close()
+            return self.cursor
 
     def getattr(self, path, fh=None):
         if path == '/':
